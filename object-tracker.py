@@ -1,3 +1,9 @@
+## Author: Aman Mishra
+## Date: June 2024
+## Module: PDE 4446 - Robot Sensing and Control
+## Professor: Dr Judhi Prasetyo and Dr. Sameer Kishore
+## Description: Real-time object tracking using color segmentation in HSV color space.
+
 import cv2
 import numpy as np
 
@@ -7,7 +13,7 @@ def nothing(x):
 
 def main():
     # Initialize webcam
-    # '0' is usually the default camera. Change to '1' if using an external USB cam.
+    # '0' is the default camera. And '1' if using an external USB cam.
     cap = cv2.VideoCapture(0)
 
     # Create a window named 'Mask & Controls'
@@ -16,10 +22,10 @@ def main():
 
     # --- Create Trackbars ---
     # Hue is 0-179 in OpenCV. Saturation and Value are 0-255.
-    # Default values are set to approximate the RED color in your image.
+    # Default values are set to approximate the RED color of the stress ball HSV(10, 100, 115).
     cv2.createTrackbar("Hue Min", "Mask & Controls", 0, 179, nothing)
     cv2.createTrackbar("Hue Max", "Mask & Controls", 10, 179, nothing)
-    cv2.createTrackbar("Sat Min", "Mask & Controls", 145, 255, nothing)
+    cv2.createTrackbar("Sat Min", "Mask & Controls", 100, 255, nothing)
     cv2.createTrackbar("Sat Max", "Mask & Controls", 255, 255, nothing)
     cv2.createTrackbar("Val Min", "Mask & Controls", 115, 255, nothing)
     cv2.createTrackbar("Val Max", "Mask & Controls", 255, 255, nothing)
@@ -27,6 +33,7 @@ def main():
     # Trackbars for Morphological Operations
     # Kernel Size: Controls the size of the structuring element (e.g., 5x5)
     # Iterations: How many times to apply the operation
+    # Best value for ball tracking seems to be KI(5, 2)
     cv2.createTrackbar("Kernel Size", "Mask & Controls", 5, 20, nothing)
     cv2.createTrackbar("Iterations", "Mask & Controls", 2, 10, nothing)
 

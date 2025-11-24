@@ -33,6 +33,14 @@ Ensure you have Python installed, then install the required dependencies:
 pip install opencv-python numpy
 ```
 
+If you have a virtual environment, be sure to activate the appropriate venv:
+
+```
+source venv/bin/activate  # For Linux/Mac
+# or
+venv\Scripts\activate  # For Windows
+```
+
 ### Running the Tracker
 
 Run the script directly from your terminal:
@@ -48,7 +56,8 @@ python red_object_tracker.py
 
 ### 1\. Color Space Filtering (RGB to HSV)
 
-We convert the input frame to HSV because separating color intensity (Value) from color information (Hue) makes the tracker less sensitive to shadows.
+The input frame is converted to HSV because separating color intensity (Value) from color information (Hue) makes the tracker less sensitive to shadows. Additionally, the values on the axes of HSV are independent of
+one another when compared to RGB.
 
 ```
 # Convert the frame to HSV
@@ -126,5 +135,3 @@ The application launches with default values tuned for a standard red object. Us
 | **Iterations**    | How aggressively to apply the smoothing.                                        |
 
 ---
-
-_Generated for Red Object Tracker Project_
