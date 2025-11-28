@@ -1,28 +1,68 @@
-## Author: Aman Mishra
-## Date: June 2024
+## Author: Aman Mishra (Updated)
+## Date: November 2025
 ## Module: PDE 4446 - Robot Sensing and Control
-## Professor: Dr Judhi Prasetyo and Dr. Sameer Kishore
-## Description: Real-time object tracking using color segmentation in HSV color space.
+## Description: Real-time object tracking using color segmentation and Serial Control.
 
 import cv2
 import numpy as np
+import serial
+import time
+
+# --- Configuration ---
+# CHANGE THIS to match your Arduino's port (e.g., 'COM3' on Windows, '/dev/ttyACM0' on Linux/Mac)
+SERIAL_PORT = 'COM8' 
+BAUD_RATE = 9600
+
+# Servo Control Variables
+# Sensitivity: How much the servo moves per frame based on error (Lower = smoother/slower, Higher = twitchy/fast)
+PAN_SENSITIVITY = 0.05
+TILT_SENSITIVITY = 0.05
+
+# Invert controls if the servos move the wrong way
+# Set to 1 for standard, -1 to invert direction
+PAN_DIR = -1 
+TILT_DIR = 1
+
+# Current Position State (Starts at Center 0.0)
+current_pan = 0.0
+current_tilt = 0.0
+
+# Initialize Serial Communication
+try:
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2) # Wait for Arduino to reset
+    print(f"Connected to Arduino on {SERIAL_PORT}")
+except Exception as e:
+    print(f"Error connecting to serial port: {e}")
+    ser = None
 
 def nothing(x):
     """Dummy function required for trackbar creation."""
     pass
 
+def send_to_arduino(pan, tilt):
+    """Sends the pan and tilt values to Arduino via Serial."""
+    if ser and ser.is_open:
+        # Format: "val1 val2\n" -> "0.00 0.00\n"
+        command = f"{pan:.4f} {tilt:.4f}\n"
+        ser.write(command.encode('utf-8'))
+
+def clamp(n, minn, maxn):
+    """Helper to keep values between min and max."""
+    return max(min(maxn, n), minn)
+
 def main():
+    global current_pan, current_tilt
+
     # Initialize webcam
-    # '0' is the default camera. And '1' if using an external USB cam.
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
 
     # Create a window named 'Mask & Controls'
     cv2.namedWindow("Mask & Controls")
     cv2.resizeWindow("Mask & Controls", 400, 500)
 
     # --- Create Trackbars ---
-    # Hue is 0-179 in OpenCV. Saturation and Value are 0-255.
-    # Default values are set to approximate the RED color of the stress ball HSV(10, 100, 115).
+    # Default values set for a specific object (adjust as needed)
     cv2.createTrackbar("Hue Min", "Mask & Controls", 0, 179, nothing)
     cv2.createTrackbar("Hue Max", "Mask & Controls", 10, 179, nothing)
     cv2.createTrackbar("Sat Min", "Mask & Controls", 100, 255, nothing)
@@ -30,10 +70,6 @@ def main():
     cv2.createTrackbar("Val Min", "Mask & Controls", 115, 255, nothing)
     cv2.createTrackbar("Val Max", "Mask & Controls", 255, 255, nothing)
 
-    # Trackbars for Morphological Operations
-    # Kernel Size: Controls the size of the structuring element (e.g., 5x5)
-    # Iterations: How many times to apply the operation
-    # Best value for ball tracking seems to be KI(5, 2)
     cv2.createTrackbar("Kernel Size", "Mask & Controls", 5, 20, nothing)
     cv2.createTrackbar("Iterations", "Mask & Controls", 2, 10, nothing)
 
@@ -46,18 +82,18 @@ def main():
             print("Failed to grab frame")
             break
 
-        # Mirror the frame (optional, feels more natural)
+        # Mirror the frame
         frame = cv2.flip(frame, 1)
         
-        # Get dimensions for finding the screen center
+        # Get dimensions
         height, width = frame.shape[:2]
         screen_center_x = width // 2
         screen_center_y = height // 2
 
-        # 2. Convert to HSV Color Space
+        # 2. Convert to HSV
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # 3. Get current positions of all trackbars
+        # 3. Get trackbar positions
         h_min = cv2.getTrackbarPos("Hue Min", "Mask & Controls")
         h_max = cv2.getTrackbarPos("Hue Max", "Mask & Controls")
         s_min = cv2.getTrackbarPos("Sat Min", "Mask & Controls")
@@ -68,71 +104,79 @@ def main():
         k_size = cv2.getTrackbarPos("Kernel Size", "Mask & Controls")
         iters = cv2.getTrackbarPos("Iterations", "Mask & Controls")
 
-        # Ensure kernel size is at least 1 and odd (required by OpenCV)
         if k_size < 1: k_size = 1
         if k_size % 2 == 0: k_size += 1
 
-        # 4. Create HSV Mask
+        # 4. Create Mask
         lower_bound = np.array([h_min, s_min, v_min])
         upper_bound = np.array([h_max, s_max, v_max])
         mask = cv2.inRange(hsv, lower_bound, upper_bound)
 
         # 5. Morphological Operations
-        # Create the structuring element (kernel)
         kernel = np.ones((k_size, k_size), np.uint8)
-        
-        # 'Opening': Erosion followed by Dilation. Removes noise (small dots).
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=iters)
-        
-        # 'Closing': Dilation followed by Erosion. Fills holes inside the object.
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iters)
 
         # 6. Contour Detection
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Variable to store the largest contour center
         cx, cy = 0, 0
+        object_detected = False
 
         if contours:
-            # Find the largest contour based on area
             largest_contour = max(contours, key=cv2.contourArea)
             
-            # Filter out very small noise that might still exist
             if cv2.contourArea(largest_contour) > 500:
-                # Draw the contour on the main frame
+                object_detected = True
                 cv2.drawContours(frame, [largest_contour], -1, (0, 255, 255), 2)
 
-                # 7. Calculate Centroid (Moments)
                 M = cv2.moments(largest_contour)
                 if M["m00"] != 0:
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
 
-                    # Draw Centroid (Red Dot)
                     cv2.circle(frame, (cx, cy), 7, (0, 0, 255), -1)
-                    
-                    # Draw Vector: From Screen Center (Blue) to Object Centroid (Red)
-                    # Using Arrowed Line for visualization
                     cv2.arrowedLine(frame, (screen_center_x, screen_center_y), (cx, cy), (0, 255, 0), 3)
-                    
-                    # Optional: Display coordinates
-                    cv2.putText(frame, f"Offset: {cx - screen_center_x}, {cy - screen_center_y}", 
-                                (cx - 20, cy - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # Draw a crosshair at the center of the screen for reference
+                    # --- TRACKING LOGIC ---
+                    
+                    # Calculate normalized error (-1.0 to 1.0) relative to screen size
+                    # Error X: -1 (Left) to +1 (Right)
+                    error_x = (cx - screen_center_x) / (width / 2)
+                    
+                    # Error Y: -1 (Top) to +1 (Bottom)
+                    error_y = (cy - screen_center_y) / (height / 2)
+
+                    # Update Servo Positions based on error (Proportional Control)
+                    # We subtract/add a fraction of the error to the current position
+                    current_pan += (error_x * PAN_SENSITIVITY * PAN_DIR)
+                    current_tilt += (error_y * TILT_SENSITIVITY * TILT_DIR)
+
+                    # Clamp values to valid Arduino input range (-1.0 to 1.0)
+                    current_pan = clamp(current_pan, -1.0, 1.0)
+                    current_tilt = clamp(current_tilt, -1.0, 1.0)
+
+                    # Send to Arduino
+                    send_to_arduino(current_pan, current_tilt)
+
+                    # Display Data on Screen
+                    cv2.putText(frame, f"Err X: {error_x:.2f} Y: {error_y:.2f}", 
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Servo: {current_pan:.2f} {current_tilt:.2f}", 
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+        # Draw Center Crosshair
         cv2.circle(frame, (screen_center_x, screen_center_y), 5, (255, 0, 0), -1)
 
-        # 8. Show Results
-        # Show the binary mask (black and white)
         cv2.imshow("Mask & Controls", mask)
-        # Show the actual video with overlays
         cv2.imshow("Object Tracker", frame)
 
-        # Exit condition
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == 27: # 'q' or ESC
+        if key == ord('q') or key == 27:
             break
 
+    if ser:
+        ser.close()
     cap.release()
     cv2.destroyAllWindows()
 
