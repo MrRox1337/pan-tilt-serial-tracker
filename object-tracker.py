@@ -1,6 +1,7 @@
 ## Author: Aman Mishra (Updated)
 ## Date: November 2025
 ## Module: PDE 4446 - Robot Sensing and Control
+## Lecturers: Dr. Judhi Prasetyo and Dr. Sameer Kishore
 ## Description: Real-time object tracking using color segmentation and Serial Control with throttled writes.
 
 import cv2
@@ -9,7 +10,7 @@ import serial
 import time
 
 # --- Configuration ---
-# CHANGE THIS to match your Arduino's port (e.g., 'COM3' on Windows, '/dev/ttyACM0' on Linux/Mac)
+# CHANGE THIS to match Arduino's port ('COM8' on Windows, '/dev/ttyACM0' on Linux/Mac)
 SERIAL_PORT = 'COM8' 
 BAUD_RATE = 9600
 SERIAL_WRITE_INTERVAL = 0.15  # 150 milliseconds in seconds
