@@ -1,7 +1,7 @@
 ## Author: Aman Mishra (Updated)
 ## Date: November 2025
 ## Module: PDE 4446 - Robot Sensing and Control
-## Description: Real-time object tracking using color segmentation and Serial Control.
+## Description: Real-time object tracking using color segmentation and Serial Control with throttled writes.
 
 import cv2
 import numpy as np
@@ -12,16 +12,17 @@ import time
 # CHANGE THIS to match your Arduino's port (e.g., 'COM3' on Windows, '/dev/ttyACM0' on Linux/Mac)
 SERIAL_PORT = 'COM8' 
 BAUD_RATE = 9600
+SERIAL_WRITE_INTERVAL = 0.15  # 150 milliseconds in seconds
 
 # Servo Control Variables
 # Sensitivity: How much the servo moves per frame based on error (Lower = smoother/slower, Higher = twitchy/fast)
-PAN_SENSITIVITY = 0.05
-TILT_SENSITIVITY = 0.05
+PAN_SENSITIVITY = 0.015
+TILT_SENSITIVITY = 0.015
 
 # Invert controls if the servos move the wrong way
 # Set to 1 for standard, -1 to invert direction
-PAN_DIR = -1 
-TILT_DIR = 1
+PAN_DIR = 1 
+TILT_DIR = -1
 
 # Current Position State (Starts at Center 0.0)
 current_pan = 0.0
@@ -63,17 +64,20 @@ def main():
 
     # --- Create Trackbars ---
     # Default values set for a specific object (adjust as needed)
-    cv2.createTrackbar("Hue Min", "Mask & Controls", 0, 179, nothing)
-    cv2.createTrackbar("Hue Max", "Mask & Controls", 10, 179, nothing)
-    cv2.createTrackbar("Sat Min", "Mask & Controls", 100, 255, nothing)
+    cv2.createTrackbar("Hue Min", "Mask & Controls", 155, 179, nothing)
+    cv2.createTrackbar("Hue Max", "Mask & Controls", 179, 179, nothing)
+    cv2.createTrackbar("Sat Min", "Mask & Controls", 161, 255, nothing)
     cv2.createTrackbar("Sat Max", "Mask & Controls", 255, 255, nothing)
-    cv2.createTrackbar("Val Min", "Mask & Controls", 115, 255, nothing)
+    cv2.createTrackbar("Val Min", "Mask & Controls", 100, 255, nothing)
     cv2.createTrackbar("Val Max", "Mask & Controls", 255, 255, nothing)
 
     cv2.createTrackbar("Kernel Size", "Mask & Controls", 5, 20, nothing)
     cv2.createTrackbar("Iterations", "Mask & Controls", 2, 10, nothing)
 
     print("Tracker Started. Press 'q' or 'ESC' to exit.")
+
+    # Initialize timer for serial throttling
+    last_serial_send_time = 0
 
     while True:
         # 1. Read Frame
@@ -121,13 +125,11 @@ def main():
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         cx, cy = 0, 0
-        object_detected = False
-
+        
         if contours:
             largest_contour = max(contours, key=cv2.contourArea)
             
             if cv2.contourArea(largest_contour) > 500:
-                object_detected = True
                 cv2.drawContours(frame, [largest_contour], -1, (0, 255, 255), 2)
 
                 M = cv2.moments(largest_contour)
@@ -141,14 +143,10 @@ def main():
                     # --- TRACKING LOGIC ---
                     
                     # Calculate normalized error (-1.0 to 1.0) relative to screen size
-                    # Error X: -1 (Left) to +1 (Right)
                     error_x = (cx - screen_center_x) / (width / 2)
-                    
-                    # Error Y: -1 (Top) to +1 (Bottom)
                     error_y = (cy - screen_center_y) / (height / 2)
 
                     # Update Servo Positions based on error (Proportional Control)
-                    # We subtract/add a fraction of the error to the current position
                     current_pan += (error_x * PAN_SENSITIVITY * PAN_DIR)
                     current_tilt += (error_y * TILT_SENSITIVITY * TILT_DIR)
 
@@ -156,8 +154,12 @@ def main():
                     current_pan = clamp(current_pan, -1.0, 1.0)
                     current_tilt = clamp(current_tilt, -1.0, 1.0)
 
-                    # Send to Arduino
-                    send_to_arduino(current_pan, current_tilt)
+                    # --- THROTTLED SERIAL WRITE ---
+                    # Only send data if enough time has passed since the last write
+                    current_time = time.time()
+                    if (current_time - last_serial_send_time) >= SERIAL_WRITE_INTERVAL:
+                        send_to_arduino(current_pan, current_tilt)
+                        last_serial_send_time = current_time
 
                     # Display Data on Screen
                     cv2.putText(frame, f"Err X: {error_x:.2f} Y: {error_y:.2f}", 
