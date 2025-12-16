@@ -3,141 +3,184 @@
 ## Module: PDE 4446 - Robot Sensing and Control
 ## Lecturers: Dr. Judhi Prasetyo and Dr. Sameer Kishore
 ## Description: Real-time object tracking with Kalman Filtering, Coasting, and Data Association (Gating).
+##
+## Detailed Overview:
+## This script implements a robust 2-axis servo tracker for a colored object.
+## It overcomes common tracking issues using three advanced techniques:
+## 1. Kalman Filtering: Smooths out jittery measurements and estimates velocity.
+## 2. Coasting (Blind Tracking): Continues moving in the last known direction if the object is briefly obstructed.
+## 3. Data Association (Gating): Prevents the tracker from snapping to a different object (e.g., a second ball)
+##    by ignoring detections that are too far from the predicted position.
 
 import cv2
 import numpy as np
 import serial
 import time
 
-# --- Configuration ---
+# --- Configuration Constants ---
 SERIAL_PORT = 'COM8' 
 BAUD_RATE = 9600
-SERIAL_WRITE_INTERVAL = 0.10
+SERIAL_WRITE_INTERVAL = 0.10  # 10Hz update rate
 
-# Servo Control Variables
-PAN_SENSITIVITY = 0.012
-TILT_SENSITIVITY = 0.012
+# Servo Control Constants
+PAN_SENSITIVITY = 0.006
+TILT_SENSITIVITY = 0.006
 DEADBAND_THRESHOLD = 0.05 
-
-# Coasting Configuration (Blind Tracking)
-MAX_COAST_FRAMES = 30  # How many frames to keep moving after object is lost (~1 second)
-
-# Data Association Configuration (The "Gate")
-# The maximum distance (in pixels) the object is allowed to "jump" between frames.
-# If the nearest object is further than this from the prediction, it is ignored (treated as a different object).
-MAX_TRACKING_GATE = 150 
-
 PAN_DIR = 1 
 TILT_DIR = -1
 
-current_pan = 0.0
-current_tilt = 0.0
+# Tracking Constants
+MAX_COAST_FRAMES = 30     # ~1 second at 30fps
+MAX_TRACKING_GATE = 150   # Max pixel jump allowed between frames
 
-# --- KALMAN FILTER CLASS ---
+
+# --- CLASSES ---
+
 class KalmanFilter:
+    """
+    A wrapper around OpenCV's KalmanFilter for 2D object tracking.
+    State Vector: [x, y, dx, dy] (Position and Velocity)
+    Measurement Vector: [x, y] (We only measure position)
+    """
     def __init__(self):
-        # 4 dynamic params (x, y, dx, dy), 2 measurement params (x, y)
+        # 4 dynamic params (state), 2 measurement params
         self.kf = cv2.KalmanFilter(4, 2)
+        
+        # Measurement Matrix (H): Maps state to measurement.
         self.kf.measurementMatrix = np.array([[1, 0, 0, 0], 
                                               [0, 1, 0, 0]], np.float32)
+        
+        # Transition Matrix (A): Models the physics of motion (Constant Velocity).
         self.kf.transitionMatrix = np.array([[1, 0, 1, 0], 
                                              [0, 1, 0, 1], 
                                              [0, 0, 1, 0], 
                                              [0, 0, 0, 1]], np.float32)
 
     def predict(self):
-        ''' Predicts the next state based on previous velocity (Blind) '''
+        ''' Predicts the next state based on current state and velocity. '''
         predicted = self.kf.predict()
-        x, y = int(predicted[0]), int(predicted[1])
-        return x, y
+        return int(predicted[0]), int(predicted[1])
 
-    def correct(self, coordX, coordY):
-        ''' Corrects the state with a new actual measurement '''
-        measured = np.array([[np.float32(coordX)], [np.float32(coordY)]])
+    def correct(self, x, y):
+        ''' Corrects the state with the actual measurement. '''
+        measured = np.array([[np.float32(x)], [np.float32(y)]])
         self.kf.correct(measured)
 
-# --- SERIAL SETUP ---
-try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)
-    print(f"Connected to Arduino on {SERIAL_PORT}")
-except Exception as e:
-    print(f"Error connecting to serial port: {e}")
-    ser = None
 
-def nothing(x):
-    pass
+class ServoController:
+    """
+    Handles Serial communication and Servo position state.
+    """
+    def __init__(self, port, baud):
+        self.pan = 0.0
+        self.tilt = 0.0
+        self.last_send_time = 0
+        self.connected = False
+        
+        try:
+            self.ser = serial.Serial(port, baud, timeout=1)
+            time.sleep(2) # Allow Arduino reset
+            print(f"Connected to Arduino on {port}")
+            self.connected = True
+        except Exception as e:
+            print(f"Error connecting to serial port: {e}")
+            self.ser = None
 
-def send_to_arduino(pan, tilt):
-    if ser and ser.is_open:
-        command = f"{pan:.4f} {tilt:.4f}\n"
-        ser.write(command.encode('utf-8'))
+    def update_and_transmit(self, target_x, target_y, screen_w, screen_h):
+        """Calculates error, updates state, and sends to Arduino (throttled)."""
+        screen_center_x = screen_w // 2
+        screen_center_y = screen_h // 2
 
-def clamp(n, minn, maxn):
-    return max(min(maxn, n), minn)
+        # Calculate normalized error (-1.0 to 1.0)
+        error_x = (target_x - screen_center_x) / (screen_w / 2)
+        error_y = (target_y - screen_center_y) / (screen_h / 2)
 
-def main():
-    global current_pan, current_tilt
+        # Apply Deadband and Sensitivity
+        if abs(error_x) > DEADBAND_THRESHOLD:
+            self.pan += (error_x * PAN_SENSITIVITY * PAN_DIR)
+        if abs(error_y) > DEADBAND_THRESHOLD:
+            self.tilt += (error_y * TILT_SENSITIVITY * TILT_DIR)
 
-    cap = cv2.VideoCapture(1)
-    kf = KalmanFilter()
+        # Clamp values
+        self.pan = max(min(1.0, self.pan), -1.0)
+        self.tilt = max(min(1.0, self.tilt), -1.0)
 
-    cv2.namedWindow("Mask & Controls")
-    cv2.resizeWindow("Mask & Controls", 400, 500)
+        self._transmit()
 
-    # Default Trackbars
-    cv2.createTrackbar("Hue Min", "Mask & Controls", 155, 179, nothing)
-    cv2.createTrackbar("Hue Max", "Mask & Controls", 179, 179, nothing)
-    cv2.createTrackbar("Sat Min", "Mask & Controls", 161, 255, nothing)
-    cv2.createTrackbar("Sat Max", "Mask & Controls", 255, 255, nothing)
-    cv2.createTrackbar("Val Min", "Mask & Controls", 100, 255, nothing)
-    cv2.createTrackbar("Val Max", "Mask & Controls", 255, 255, nothing)
-    cv2.createTrackbar("Kernel Size", "Mask & Controls", 5, 20, nothing)
-    cv2.createTrackbar("Iterations", "Mask & Controls", 2, 10, nothing)
+    def reset_to_center(self):
+        """Resets servos to (0,0) and transmits immediately."""
+        self.pan = 0.0
+        self.tilt = 0.0
+        self._transmit()
 
-    print("Tracker Started. Press 'q' or 'ESC' to exit.")
+    def _transmit(self):
+        """Internal method to send data if throttling interval has passed."""
+        current_time = time.time()
+        if (current_time - self.last_send_time) >= SERIAL_WRITE_INTERVAL:
+            if self.connected and self.ser.is_open:
+                command = f"{self.pan:.4f} {self.tilt:.4f}\n"
+                self.ser.write(command.encode('utf-8'))
+            self.last_send_time = current_time
+    
+    def close(self):
+        if self.connected and self.ser:
+            self.ser.close()
 
-    last_serial_send_time = 0
-    # Start in "Lost" state so we pick the largest object immediately on startup
-    frames_without_detection = MAX_COAST_FRAMES 
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
+class VisionSystem:
+    """
+    Handles OpenCV Windows, Trackbars, and Image Processing Pipeline.
+    """
+    def __init__(self):
+        self.window_name = "Mask & Controls"
+        cv2.namedWindow(self.window_name)
+        cv2.resizeWindow(self.window_name, 400, 500)
+        self._create_trackbars()
 
-        frame = cv2.flip(frame, 1)
-        height, width = frame.shape[:2]
-        screen_center_x = width // 2
-        screen_center_y = height // 2
+    def _nothing(self, x): pass
 
-        # Color & Masking
+    def _create_trackbars(self):
+        cv2.createTrackbar("Hue Min", self.window_name, 155, 179, self._nothing)
+        cv2.createTrackbar("Hue Max", self.window_name, 179, 179, self._nothing)
+        cv2.createTrackbar("Sat Min", self.window_name, 103, 255, self._nothing)
+        cv2.createTrackbar("Sat Max", self.window_name, 255, 255, self._nothing)
+        cv2.createTrackbar("Val Min", self.window_name, 100, 255, self._nothing)
+        cv2.createTrackbar("Val Max", self.window_name, 255, 255, self._nothing)
+        cv2.createTrackbar("Kernel Size", self.window_name, 5, 20, self._nothing)
+        cv2.createTrackbar("Iterations", self.window_name, 2, 10, self._nothing)
+
+    def process_frame(self, frame):
+        """
+        Takes a raw frame, applies HSV/Morph filters, and finds object candidates.
+        Returns: (processed_mask, list_of_candidates)
+        """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        h_min = cv2.getTrackbarPos("Hue Min", "Mask & Controls")
-        h_max = cv2.getTrackbarPos("Hue Max", "Mask & Controls")
-        s_min = cv2.getTrackbarPos("Sat Min", "Mask & Controls")
-        s_max = cv2.getTrackbarPos("Sat Max", "Mask & Controls")
-        v_min = cv2.getTrackbarPos("Val Min", "Mask & Controls")
-        v_max = cv2.getTrackbarPos("Val Max", "Mask & Controls")
-        k_size = cv2.getTrackbarPos("Kernel Size", "Mask & Controls")
-        iters = cv2.getTrackbarPos("Iterations", "Mask & Controls")
-        
+        # Get Trackbar Values
+        h_min = cv2.getTrackbarPos("Hue Min", self.window_name)
+        h_max = cv2.getTrackbarPos("Hue Max", self.window_name)
+        s_min = cv2.getTrackbarPos("Sat Min", self.window_name)
+        s_max = cv2.getTrackbarPos("Sat Max", self.window_name)
+        v_min = cv2.getTrackbarPos("Val Min", self.window_name)
+        v_max = cv2.getTrackbarPos("Val Max", self.window_name)
+        k_size = cv2.getTrackbarPos("Kernel Size", self.window_name)
+        iters = cv2.getTrackbarPos("Iterations", self.window_name)
+
         if k_size < 1: k_size = 1
         if k_size % 2 == 0: k_size += 1
 
-        lower_bound = np.array([h_min, s_min, v_min])
-        upper_bound = np.array([h_max, s_max, v_max])
-        mask = cv2.inRange(hsv, lower_bound, upper_bound)
+        # Create Mask
+        lower = np.array([h_min, s_min, v_min])
+        upper = np.array([h_max, s_max, v_max])
+        mask = cv2.inRange(hsv, lower, upper)
+        
+        # Morphological Ops
         kernel = np.ones((k_size, k_size), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=iters)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=iters)
 
+        # Extract Candidates
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # --- PREDICT ---
-        pred_x, pred_y = kf.predict()
-
-        # --- 1. EXTRACT VALID CANDIDATES ---
         candidates = []
         if contours:
             for cnt in contours:
@@ -147,108 +190,105 @@ def main():
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
                         candidates.append({'cnt': cnt, 'cx': cx, 'cy': cy})
+        
+        return mask, candidates
+
+
+# --- MAIN LOGIC ---
+
+def main():
+    # 1. Initialization
+    cap = cv2.VideoCapture(1)
+    kf = KalmanFilter()
+    servo = ServoController(SERIAL_PORT, BAUD_RATE)
+    vision = VisionSystem()
+
+    print("Tracker Started. Press 'q' or 'ESC' to exit.")
+
+    # State Variables
+    frames_without_detection = MAX_COAST_FRAMES 
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret: break
+
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+        screen_center_x, screen_center_y = w // 2, h // 2
+
+        # 2. Vision Processing
+        mask, candidates = vision.process_frame(frame)
+
+        # 3. Kalman Prediction Step (Always run this!)
+        pred_x, pred_y = kf.predict()
 
         matched_candidate = None
         target_x, target_y = None, None
         tracking_status = "Scanning"
 
-        # --- 2. INTELLIGENT SELECTION (The Fix) ---
+        # 4. Data Association (Intelligent Selection Logic)
         if candidates:
-            # Case A: We are already tracking/coasting (frames_without_detection is low)
-            # Strategy: Find candidate CLOSEST to prediction (ignore others)
+            # Case A: We are Tracking/Coasting -> Use Gating
             if frames_without_detection < MAX_COAST_FRAMES:
-                # Find candidate with minimum distance to predicted point
-                best_candidate = min(candidates, key=lambda c: (c['cx']-pred_x)**2 + (c['cy']-pred_y)**2)
-                dist = ((best_candidate['cx']-pred_x)**2 + (best_candidate['cy']-pred_y)**2)**0.5
+                # Find candidate closest to Prediction
+                best = min(candidates, key=lambda c: (c['cx']-pred_x)**2 + (c['cy']-pred_y)**2)
+                dist = ((best['cx']-pred_x)**2 + (best['cy']-pred_y)**2)**0.5
                 
-                # GATE CHECK: Is it within reasonable distance?
                 if dist < MAX_TRACKING_GATE:
-                    matched_candidate = best_candidate
-                else:
-                    # Best candidate is too far! It's likely a different object.
-                    # Ignore it and let coasting happen.
-                    pass 
+                    matched_candidate = best
+                # Else: Ignore (it's likely a distractor)
 
-            # Case B: We are totally lost (startup or timeout)
-            # Strategy: Just find the LARGEST object to re-acquire
+            # Case B: Lost/Initializing -> Pick Largest
             else:
                 matched_candidate = max(candidates, key=lambda c: cv2.contourArea(c['cnt']))
 
-        # --- 3. UPDATE LOGIC ---
+        # 5. Measurement Update (Correction)
         if matched_candidate:
-            # We found the correct object!
             cx, cy = matched_candidate['cx'], matched_candidate['cy']
-            
-            # Correct KF
             kf.correct(cx, cy)
             
-            # Reset coasting
             frames_without_detection = 0
-            target_x, target_y = pred_x, pred_y
+            # Drive servos using Prediction (smoother) or Actual (cx, cy)
+            target_x, target_y = pred_x, pred_y 
             tracking_status = "Locked"
 
-            # Vis: Red dot on raw measurement
+            # Visuals
             cv2.drawContours(frame, [matched_candidate['cnt']], -1, (0, 255, 255), 2)
-            cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1) 
-            # Vis: Blue dot on prediction
-            cv2.circle(frame, (pred_x, pred_y), 5, (255, 0, 0), -1)
+            cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1) # Raw
+            cv2.circle(frame, (pred_x, pred_y), 5, (255, 0, 0), -1) # Pred
 
-        # --- COASTING LOGIC (Same as before) ---
+        # 6. Coasting Logic
         if target_x is None:
             if frames_without_detection < MAX_COAST_FRAMES:
                 frames_without_detection += 1
                 target_x, target_y = pred_x, pred_y
                 tracking_status = f"Coasting ({frames_without_detection})"
                 
-                cv2.circle(frame, (pred_x, pred_y), 10, (0, 255, 255), 2) 
-                cv2.putText(frame, "LOST - PREDICTING", (pred_x + 15, pred_y), 
+                # Visuals
+                cv2.circle(frame, (pred_x, pred_y), 10, (0, 255, 255), 2)
+                cv2.putText(frame, "LOST - PREDICTING", (pred_x+15, pred_y), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                
-                # Vis: Draw the gate so you can see where it's looking
                 cv2.circle(frame, (pred_x, pred_y), MAX_TRACKING_GATE, (50, 50, 50), 1)
             else:
                 tracking_status = "Lost - Returning to Center"
-                current_pan = 0.0
-                current_tilt = 0.0
+                servo.reset_to_center()
 
-        # --- SERVO CONTROL ---
-        pan_update = 0.0
-        tilt_update = 0.0
-
+        # 7. Servo Control
         if target_x is not None:
-            error_x = (target_x - screen_center_x) / (width / 2)
-            error_y = (target_y - screen_center_y) / (height / 2)
-
-            if abs(error_x) > DEADBAND_THRESHOLD:
-                pan_update = (error_x * PAN_SENSITIVITY * PAN_DIR)
-            if abs(error_y) > DEADBAND_THRESHOLD:
-                tilt_update = (error_y * TILT_SENSITIVITY * TILT_DIR)
-
-            current_pan += pan_update
-            current_tilt += tilt_update
-            
+            servo.update_and_transmit(target_x, target_y, w, h)
             cv2.arrowedLine(frame, (screen_center_x, screen_center_y), (target_x, target_y), (0, 255, 0), 2)
 
-        current_pan = clamp(current_pan, -1.0, 1.0)
-        current_tilt = clamp(current_tilt, -1.0, 1.0)
-
-        # Serial Write
-        current_time = time.time()
-        if (current_time - last_serial_send_time) >= SERIAL_WRITE_INTERVAL:
-            send_to_arduino(current_pan, current_tilt)
-            last_serial_send_time = current_time
-
-        # UI Info
+        # 8. UI Overlay
         cv2.putText(frame, f"Status: {tracking_status}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(frame, f"Servo: {current_pan:.2f} {current_tilt:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-        
+        cv2.putText(frame, f"Servo: {servo.pan:.2f} {servo.tilt:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
         cv2.circle(frame, (screen_center_x, screen_center_y), 5, (255, 0, 0), -1)
-        cv2.imshow("Mask & Controls", mask)
+        
+        cv2.imshow(vision.window_name, mask)
         cv2.imshow("Object Tracker", frame)
 
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-    if ser: ser.close()
+    servo.close()
     cap.release()
     cv2.destroyAllWindows()
 
