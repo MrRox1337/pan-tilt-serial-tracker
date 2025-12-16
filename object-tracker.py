@@ -1,6 +1,6 @@
-## Author: Aman Mishra (Updated)
-## Date: November 2025
-## Module: PDE 4446 - Robot Sensing and Control
+## Author: Aman Mishra
+## Date: December 2025
+## Module: PDE 4446 - Motion Control and Sensing
 ## Lecturers: Dr. Judhi Prasetyo and Dr. Sameer Kishore
 ## Description: Real-time object tracking with Kalman Filtering, Coasting, and Data Association (Gating).
 ##
