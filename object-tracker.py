@@ -2,7 +2,7 @@
 ## Date: November 2025
 ## Module: PDE 4446 - Robot Sensing and Control
 ## Lecturers: Dr. Judhi Prasetyo and Dr. Sameer Kishore
-## Description: Real-time object tracking with Kalman Filtering and "Coasting" (Blind Tracking).
+## Description: Real-time object tracking with Kalman Filtering, Coasting, and Data Association (Gating).
 
 import cv2
 import numpy as np
@@ -22,13 +22,18 @@ DEADBAND_THRESHOLD = 0.05
 # Coasting Configuration (Blind Tracking)
 MAX_COAST_FRAMES = 30  # How many frames to keep moving after object is lost (~1 second)
 
+# Data Association Configuration (The "Gate")
+# The maximum distance (in pixels) the object is allowed to "jump" between frames.
+# If the nearest object is further than this from the prediction, it is ignored (treated as a different object).
+MAX_TRACKING_GATE = 150 
+
 PAN_DIR = 1 
 TILT_DIR = -1
 
 current_pan = 0.0
 current_tilt = 0.0
 
-# --- KALMAN FILTER CLASS (Refactored) ---
+# --- KALMAN FILTER CLASS ---
 class KalmanFilter:
     def __init__(self):
         # 4 dynamic params (x, y, dx, dy), 2 measurement params (x, y)
@@ -93,7 +98,8 @@ def main():
     print("Tracker Started. Press 'q' or 'ESC' to exit.")
 
     last_serial_send_time = 0
-    frames_without_detection = 0
+    # Start in "Lost" state so we pick the largest object immediately on startup
+    frames_without_detection = MAX_COAST_FRAMES 
 
     while True:
         ret, frame = cap.read()
@@ -128,51 +134,80 @@ def main():
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # --- KEY CHANGE: PREDICT EVERY FRAME ---
-        # We ask the filter: "Based on previous speed, where is it now?"
+        # --- PREDICT ---
         pred_x, pred_y = kf.predict()
 
+        # --- 1. EXTRACT VALID CANDIDATES ---
+        candidates = []
+        if contours:
+            for cnt in contours:
+                if cv2.contourArea(cnt) > 500:
+                    M = cv2.moments(cnt)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        candidates.append({'cnt': cnt, 'cx': cx, 'cy': cy})
+
+        matched_candidate = None
         target_x, target_y = None, None
         tracking_status = "Scanning"
 
-        if contours:
-            largest_contour = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 500:
-                # 1. MEASUREMENT: We found the object!
-                M = cv2.moments(largest_contour)
-                if M["m00"] != 0:
-                    cx = int(M["m10"] / M["m00"])
-                    cy = int(M["m01"] / M["m00"])
-                    
-                    # 2. CORRECT: Tell the filter the ACTUAL location
-                    kf.correct(cx, cy)
-                    
-                    # Reset lost counter
-                    frames_without_detection = 0
-                    target_x, target_y = pred_x, pred_y
-                    tracking_status = "Locked"
-
-                    # Visualization
-                    cv2.drawContours(frame, [largest_contour], -1, (0, 255, 255), 2)
-                    cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1) # Red = Raw
-                    cv2.circle(frame, (pred_x, pred_y), 5, (255, 0, 0), -1) # Blue = Filtered
-
-        # --- COASTING LOGIC ---
-        if target_x is None:
-            # We didn't see the object. Should we coast?
+        # --- 2. INTELLIGENT SELECTION (The Fix) ---
+        if candidates:
+            # Case A: We are already tracking/coasting (frames_without_detection is low)
+            # Strategy: Find candidate CLOSEST to prediction (ignore others)
             if frames_without_detection < MAX_COAST_FRAMES:
-                # Yes! Use the pure prediction to lead the camera
+                # Find candidate with minimum distance to predicted point
+                best_candidate = min(candidates, key=lambda c: (c['cx']-pred_x)**2 + (c['cy']-pred_y)**2)
+                dist = ((best_candidate['cx']-pred_x)**2 + (best_candidate['cy']-pred_y)**2)**0.5
+                
+                # GATE CHECK: Is it within reasonable distance?
+                if dist < MAX_TRACKING_GATE:
+                    matched_candidate = best_candidate
+                else:
+                    # Best candidate is too far! It's likely a different object.
+                    # Ignore it and let coasting happen.
+                    pass 
+
+            # Case B: We are totally lost (startup or timeout)
+            # Strategy: Just find the LARGEST object to re-acquire
+            else:
+                matched_candidate = max(candidates, key=lambda c: cv2.contourArea(c['cnt']))
+
+        # --- 3. UPDATE LOGIC ---
+        if matched_candidate:
+            # We found the correct object!
+            cx, cy = matched_candidate['cx'], matched_candidate['cy']
+            
+            # Correct KF
+            kf.correct(cx, cy)
+            
+            # Reset coasting
+            frames_without_detection = 0
+            target_x, target_y = pred_x, pred_y
+            tracking_status = "Locked"
+
+            # Vis: Red dot on raw measurement
+            cv2.drawContours(frame, [matched_candidate['cnt']], -1, (0, 255, 255), 2)
+            cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1) 
+            # Vis: Blue dot on prediction
+            cv2.circle(frame, (pred_x, pred_y), 5, (255, 0, 0), -1)
+
+        # --- COASTING LOGIC (Same as before) ---
+        if target_x is None:
+            if frames_without_detection < MAX_COAST_FRAMES:
                 frames_without_detection += 1
                 target_x, target_y = pred_x, pred_y
                 tracking_status = f"Coasting ({frames_without_detection})"
                 
-                # Visual Warning
-                cv2.circle(frame, (pred_x, pred_y), 10, (0, 255, 255), 2) # Yellow Empty Circle
-                cv2.putText(frame, "LOST SIGNAL - PREDICTING", (pred_x + 15, pred_y), 
+                cv2.circle(frame, (pred_x, pred_y), 10, (0, 255, 255), 2) 
+                cv2.putText(frame, "LOST - PREDICTING", (pred_x + 15, pred_y), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                
+                # Vis: Draw the gate so you can see where it's looking
+                cv2.circle(frame, (pred_x, pred_y), MAX_TRACKING_GATE, (50, 50, 50), 1)
             else:
                 tracking_status = "Lost - Returning to Center"
-                # Safety Cutoff Triggered: Reset servos to center
                 current_pan = 0.0
                 current_tilt = 0.0
 
@@ -181,7 +216,6 @@ def main():
         tilt_update = 0.0
 
         if target_x is not None:
-            # Calculate error based on whatever target we have (Locked or Coasting)
             error_x = (target_x - screen_center_x) / (width / 2)
             error_y = (target_y - screen_center_y) / (height / 2)
 
@@ -193,7 +227,6 @@ def main():
             current_pan += pan_update
             current_tilt += tilt_update
             
-            # Draw Vector
             cv2.arrowedLine(frame, (screen_center_x, screen_center_y), (target_x, target_y), (0, 255, 0), 2)
 
         current_pan = clamp(current_pan, -1.0, 1.0)
