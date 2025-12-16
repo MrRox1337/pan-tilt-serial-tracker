@@ -2,7 +2,7 @@
 ## Date: November 2025
 ## Module: PDE 4446 - Robot Sensing and Control
 ## Lecturers: Dr. Judhi Prasetyo and Dr. Sameer Kishore
-## Description: Real-time object tracking using color segmentation and Serial Control with throttled writes.
+## Description: Real-time object tracking using color segmentation, Kalman Filtering, and Serial Control.
 
 import cv2
 import numpy as np
@@ -20,8 +20,10 @@ SERIAL_WRITE_INTERVAL = 0.10  # 100 milliseconds in seconds
 PAN_SENSITIVITY = 0.012
 TILT_SENSITIVITY = 0.012
 
+# Deadband Threshold (Normalized error range where no adjustment is made)
+DEADBAND_THRESHOLD = 0.05 
+
 # Invert controls if the servos move the wrong way
-# Set to 1 for standard, -1 to invert direction
 PAN_DIR = 1 
 TILT_DIR = -1
 
@@ -29,7 +31,29 @@ TILT_DIR = -1
 current_pan = 0.0
 current_tilt = 0.0
 
-# Initialize Serial Communication
+# --- KALMAN FILTER CLASS ---
+class KalmanFilter:
+    def __init__(self):
+        # 4 dynamic params (x, y, dx, dy), 2 measurement params (x, y)
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], 
+                                              [0, 1, 0, 0]], np.float32)
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], 
+                                             [0, 1, 0, 1], 
+                                             [0, 0, 1, 0], 
+                                             [0, 0, 0, 1]], np.float32)
+
+    def predict(self, coordX, coordY):
+        ''' estimates the position of the object '''
+        # Correct the state with the latest measurement
+        measured = np.array([[np.float32(coordX)], [np.float32(coordY)]])
+        self.kf.correct(measured)
+        # Predict the next state
+        predicted = self.kf.predict()
+        x, y = int(predicted[0]), int(predicted[1])
+        return x, y
+
+# --- SERIAL SETUP ---
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     time.sleep(2) # Wait for Arduino to reset
@@ -45,7 +69,6 @@ def nothing(x):
 def send_to_arduino(pan, tilt):
     """Sends the pan and tilt values to Arduino via Serial."""
     if ser and ser.is_open:
-        # Format: "val1 val2\n" -> "0.00 0.00\n"
         command = f"{pan:.4f} {tilt:.4f}\n"
         ser.write(command.encode('utf-8'))
 
@@ -59,12 +82,14 @@ def main():
     # Initialize webcam
     cap = cv2.VideoCapture(1)
 
+    # Initialize Kalman Filter
+    kf = KalmanFilter()
+
     # Create a window named 'Mask & Controls'
     cv2.namedWindow("Mask & Controls")
     cv2.resizeWindow("Mask & Controls", 400, 500)
 
     # --- Create Trackbars ---
-    # Default values set for a specific object (adjust as needed)
     cv2.createTrackbar("Hue Min", "Mask & Controls", 155, 179, nothing)
     cv2.createTrackbar("Hue Max", "Mask & Controls", 179, 179, nothing)
     cv2.createTrackbar("Sat Min", "Mask & Controls", 161, 255, nothing)
@@ -77,7 +102,6 @@ def main():
 
     print("Tracker Started. Press 'q' or 'ESC' to exit.")
 
-    # Initialize timer for serial throttling
     last_serial_send_time = 0
 
     while True:
@@ -87,10 +111,7 @@ def main():
             print("Failed to grab frame")
             break
 
-        # Mirror the frame
         frame = cv2.flip(frame, 1)
-        
-        # Get dimensions
         height, width = frame.shape[:2]
         screen_center_x = width // 2
         screen_center_y = height // 2
@@ -135,38 +156,57 @@ def main():
 
                 M = cv2.moments(largest_contour)
                 if M["m00"] != 0:
+                    # Calculate raw centroid
                     cx = int(M["m10"] / M["m00"])
                     cy = int(M["m01"] / M["m00"])
 
-                    cv2.circle(frame, (cx, cy), 7, (0, 0, 255), -1)
-                    cv2.arrowedLine(frame, (screen_center_x, screen_center_y), (cx, cy), (0, 255, 0), 3)
+                    # --- KALMAN FILTER PREDICTION ---
+                    # Predict the next position based on the current measurement
+                    pred_x, pred_y = kf.predict(cx, cy)
 
-                    # --- TRACKING LOGIC ---
+                    # Draw Raw (Red) and Predicted (Blue) positions
+                    cv2.circle(frame, (cx, cy), 7, (0, 0, 255), -1) # Raw (Red)
+                    cv2.circle(frame, (pred_x, pred_y), 7, (255, 0, 0), -1) # Predicted (Blue)
                     
-                    # Calculate normalized error (-1.0 to 1.0) relative to screen size
-                    error_x = (cx - screen_center_x) / (width / 2)
-                    error_y = (cy - screen_center_y) / (height / 2)
+                    # Draw vector to PREDICTED position (Green)
+                    cv2.arrowedLine(frame, (screen_center_x, screen_center_y), (pred_x, pred_y), (0, 255, 0), 3)
 
-                    # Update Servo Positions based on error (Proportional Control)
-                    current_pan += (error_x * PAN_SENSITIVITY * PAN_DIR)
-                    current_tilt += (error_y * TILT_SENSITIVITY * TILT_DIR)
+                    # --- TRACKING LOGIC (Using Predicted Coordinates) ---
+                    # We use pred_x/pred_y for smoother control
+                    error_x = (pred_x - screen_center_x) / (width / 2)
+                    error_y = (pred_y - screen_center_y) / (height / 2)
+                    
+                    # --- DEADZONE ---
+                    pan_update = 0.0
+                    if abs(error_x) > DEADBAND_THRESHOLD:
+                        pan_update = (error_x * PAN_SENSITIVITY * PAN_DIR)
+                        
+                    tilt_update = 0.0
+                    if abs(error_y) > DEADBAND_THRESHOLD:
+                        tilt_update = (error_y * TILT_SENSITIVITY * TILT_DIR)
 
-                    # Clamp values to valid Arduino input range (-1.0 to 1.0)
+                    current_pan += pan_update
+                    current_tilt += tilt_update
+
                     current_pan = clamp(current_pan, -1.0, 1.0)
                     current_tilt = clamp(current_tilt, -1.0, 1.0)
 
                     # --- THROTTLED SERIAL WRITE ---
-                    # Only send data if enough time has passed since the last write
                     current_time = time.time()
                     if (current_time - last_serial_send_time) >= SERIAL_WRITE_INTERVAL:
                         send_to_arduino(current_pan, current_tilt)
                         last_serial_send_time = current_time
 
-                    # Display Data on Screen
+                    # Display Data
                     cv2.putText(frame, f"Err X: {error_x:.2f} Y: {error_y:.2f}", 
                                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     cv2.putText(frame, f"Servo: {current_pan:.2f} {current_tilt:.2f}", 
                                 (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                    
+                    pan_status = "Adjusting" if pan_update != 0.0 else "Deadband"
+                    tilt_status = "Adjusting" if tilt_update != 0.0 else "Deadband"
+                    cv2.putText(frame, f"Status: {pan_status}", 
+                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         # Draw Center Crosshair
         cv2.circle(frame, (screen_center_x, screen_center_y), 5, (255, 0, 0), -1)
