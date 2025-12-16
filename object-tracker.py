@@ -13,12 +13,12 @@ import time
 # CHANGE THIS to match Arduino's port ('COM8' on Windows, '/dev/ttyACM0' on Linux/Mac)
 SERIAL_PORT = 'COM8' 
 BAUD_RATE = 9600
-SERIAL_WRITE_INTERVAL = 0.15  # 150 milliseconds in seconds
+SERIAL_WRITE_INTERVAL = 0.10  # 100 milliseconds in seconds
 
 # Servo Control Variables
 # Sensitivity: How much the servo moves per frame based on error (Lower = smoother/slower, Higher = twitchy/fast)
-PAN_SENSITIVITY = 0.015
-TILT_SENSITIVITY = 0.015
+PAN_SENSITIVITY = 0.012
+TILT_SENSITIVITY = 0.012
 
 # Invert controls if the servos move the wrong way
 # Set to 1 for standard, -1 to invert direction
