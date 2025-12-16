@@ -82,6 +82,10 @@ Adjust the constants at the top of the script to match your hardware:
    - **Green Arrow:** Vector driving the servos.
 5. Press 'q' or 'ESC' to exit safely.
 
+## 7. Video Demonstration
+
+[![Video demonstration with explanation (5:56)](https://img.youtube.com/vi/ZYJHcxjyrwg/hqdefault.jpg)](https://youtu.be/ZYJHcxjyrwg)
+
 ## 7. Troubleshooting
 
 - **Jittering Servos:** Decrease `SENSITIVITY` or increase `DEADBAND_THRESHOLD`.
